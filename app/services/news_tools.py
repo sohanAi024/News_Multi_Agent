@@ -35,75 +35,85 @@ class NewsTools:
         self.session = SessionLocal()
 
     def normalize_category(self, category: str) -> str:
+        """
+        Clean category names for better display.
+        """
         if not category:
             return "General"
         category = re.sub(r'^Category:\s*', '', category)
         category = re.sub(r'\(.*?\)', '', category)
         return category.strip()
 
-    def is_ai_related(self, title: str, content: str) -> bool:
+    def filter_relevant_batch(self, articles: list, user_query: str) -> list:
         """
-        LLM check: Is this news about AI?
+        Batch relevance filtering using LLM.
+        Returns indices of relevant articles.
         """
-        prompt = (
-            f"Determine if the following news is specifically related to Artificial Intelligence (AI). "
-            f"Return only 'YES' or 'NO'.\n\n"
-            f"Title: {title}\n"
-            f"Content: {content[:500]}..."
+        formatted_articles = "\n".join(
+            [f"{i+1}. Title: {a['title']}\nContent: {a['content'][:300]}..." for i, a in enumerate(articles)]
         )
-        response = self.llm.invoke(prompt).content.strip().upper()
-        return response == "YES"
+
+        prompt = (
+            f"User Query: {user_query}\n\n"
+            f"Articles:\n{formatted_articles}\n\n"
+            "Which articles are relevant to the user query? "
+            "Return only a comma-separated list of numbers (e.g., 1,3,5)."
+        )
+
+        response = self.llm.invoke(prompt).content.strip()
+        relevant_indices = [int(i)-1 for i in response.split(",") if i.strip().isdigit()]
+        return relevant_indices
 
     def search_news(self, query: str) -> str:
         """
-        Advanced AI-news-only search:
-        - Detect AI relevance in results.
-        - Combine vector similarity + keyword fallback.
-        - Summarize top results.
+        Advanced news search with:
+        - Vector similarity search.
+        - Batch LLM relevance filtering.
+        - Hybrid ranking (vector + keywords).
+        - Summarized response.
         """
         try:
-            # ✅ Step 1: Query embedding
+            # ✅ Step 1: Generate query embedding
             query_embedding = embedding_model.encode(query).tolist()
 
-            # ✅ Step 2: Search by vector similarity
+            # ✅ Step 2: Fetch top 30 similar articles from DB
             stmt = (
                 select(
                     NewsDocument,
                     NewsDocument.embedding.cosine_distance(query_embedding).label("distance")
                 )
                 .order_by("distance")
+                .limit(30)
             )
             rows = self.session.execute(stmt).all()
-
             if not rows:
                 return f"❗ No news found for '{query}'."
 
-            # ✅ Step 3: Filter AI-related articles (strict)
-            ai_news = []
-            for doc, distance in rows:
-                if self.is_ai_related(doc.title, doc.content):
-                    ai_news.append((doc, distance))
+            # ✅ Step 3: Prepare for batch relevance filtering
+            articles = [{"title": doc.title, "content": doc.content, "doc": doc} for doc, _ in rows]
 
-            if not ai_news:
-                return "❗ No AI-related news found for your query."
+            relevant_indices = self.filter_relevant_batch(articles, query)
+            if not relevant_indices:
+                return f"❗ No relevant news found for '{query}'."
 
-            # ✅ Step 4: Apply threshold + keyword relevance
-            threshold = 0.75
-            ranked = []
+            # ✅ Step 4: Select relevant docs
+            relevant_news = [(articles[i]["doc"], rows[i][1]) for i in relevant_indices]
+
+            # ✅ Step 5: Hybrid ranking (vector + keyword boost)
             keywords = query.lower().split()
-            for doc, dist in ai_news:
-                score = 1 - dist
-                keyword_match = sum(k in (doc.title.lower() + doc.content.lower()) for k in keywords)
-                final_score = score + (0.05 * keyword_match)
+            ranked = []
+            for doc, dist in relevant_news:
+                similarity_score = 1 - dist
+                keyword_hits = sum(k in (doc.title.lower() + doc.content.lower()) for k in keywords)
+                final_score = similarity_score + (0.05 * keyword_hits)
                 ranked.append((doc, final_score))
 
-            # Sort by final score
             ranked.sort(key=lambda x: x[1], reverse=True)
             top_results = ranked[:5]
 
-            # ✅ Step 5: Prepare context for summarization
+            # ✅ Step 6: Prepare context for summarization
             news_chunks = []
-            for doc, score in top_results:
+            for doc, _ in top_results:
                 normalized_category = self.normalize_category(doc.category)
                 news_chunks.append(
                     f"📰 **Title:** {doc.title}\n"
@@ -114,25 +124,24 @@ class NewsTools:
                 )
             context_text = "\n\n".join(news_chunks)
 
-            # ✅ Step 6: LLM summarization
+            # ✅ Step 7: LLM summarization
             prompt = (
-                "You are an expert news summarizer. Based on these AI-related articles, answer:\n"
+                "You are an expert news assistant. Based on the following relevant news articles, "
+                "answer the user's query:\n"
                 f"User Query: {query}\n\n"
                 "Provide:\n"
-                "1. A short, direct answer.\n"
+                "1. A short direct answer.\n"
                 "2. A concise summary of the main points.\n\n"
                 f"Articles:\n{context_text}\n\nAnswer:"
             )
             summary = self.llm.invoke(prompt).content
 
-            return f"🤖 {summary}\n\n📌 Top Matching AI News:\n{context_text}"
+            return f"🤖 {summary}\n\n📌 Top Relevant News:\n{context_text}"
 
         except Exception as e:
-            return f"❌ Error during AI news search: {str(e)}"
+            return f"❌ Error during news search: {str(e)}"
         finally:
             self.session.close()
-
-
 
 
     def translate_text(self, text, language="Hindi"):
