@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-dotenv
+sqlalchemy
+pgvector
+sentence-transformers
+langchain-groq
+langchain-mistralai
+langgraph
+requests
+fpdf
+reportlab
+python-multipart
